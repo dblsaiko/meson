@@ -144,6 +144,8 @@ if T.TYPE_CHECKING:
 
     TestClass = T.TypeVar('TestClass', bound=Test)
 
+BT = T.TypeVar('BT', bound=build.BuildTarget)
+
 def _project_version_validator(value: T.Union[T.List, str, mesonlib.File, None]) -> T.Optional[str]:
     if isinstance(value, list):
         if len(value) != 1:
@@ -462,6 +464,9 @@ class Interpreter(InterpreterBase, HoldableObject):
             build.SharedModule: OBJ.SharedModuleHolder,
             build.Executable: OBJ.ExecutableHolder,
             build.Jar: OBJ.JarHolder,
+            build.AppBundle: OBJ.AppBundleHolder,
+            build.FrameworkBundle: OBJ.FrameworkBundleHolder,
+            build.BundleTarget: OBJ.BundleTargetHolder,
             build.CustomTarget: OBJ.CustomTargetHolder,
             build.CustomTargetIndex: OBJ.CustomTargetIndexHolder,
             build.Generator: OBJ.GeneratorHolder,
@@ -1609,6 +1614,7 @@ class Interpreter(InterpreterBase, HoldableObject):
     def add_languages_for(self, args: T.List[Language], required: bool, for_machine: MachineChoice) -> bool:
         langs = set(self.compilers[for_machine])
         langs.update(args)
+        new_langs = set()
 
         # Some languages are added only as implementation details of other
         # languages. When that happens, we don't want to add those languages to
@@ -1690,8 +1696,25 @@ class Interpreter(InterpreterBase, HoldableObject):
             self.build.ensure_static_linker(comp)
             if lang not in internal:
                 self.compilers[for_machine][lang] = comp
+                new_langs.add(lang)
+
+        if new_langs:
+            self.did_add_languages_for(for_machine, new_langs)
 
         return success
+
+    def did_add_languages_for(self, for_machine: MachineChoice, new_languages: T.Set[str]):
+        from mesonbuild.compilers.cpp import CPPCompiler
+
+        swift_and_cpp = {'swift', 'cpp'}
+
+        # call this once, after both have been added
+        if all(name in self.compilers[for_machine] for name in swift_and_cpp) and \
+                new_languages.intersection(swift_and_cpp):
+            compilers = self.compilers[for_machine]
+            cpp = compilers['cpp']
+            assert isinstance(cpp, CPPCompiler)
+            cpp.detect_works_with_swift()
 
     def program_from_file_for(self, for_machine: MachineChoice, prognames: T.List[mesonlib.FileOrString]
                               ) -> T.Optional[ExternalProgram]:
@@ -3519,6 +3542,9 @@ class Interpreter(InterpreterBase, HoldableObject):
         if idname not in self.coredata.target_guids:
             self.coredata.target_guids[idname] = str(uuid.uuid4()).upper()
 
+        if isinstance(tobj, build.BuildTarget):
+            self.project_args_frozen = True
+
     @FeatureNew('both_libraries', '0.46.0')
     def build_both_libraries(self, node: mparser.BaseNode, args: T.Tuple[str, SourcesVarargsType], kwargs: kwtypes.Library) -> build.BothLibraries:
         shared_lib = self.build_target(node, args, kwargs, build.SharedLibrary, shared_library_only=False)
@@ -3752,6 +3778,12 @@ class Interpreter(InterpreterBase, HoldableObject):
                     final[f'{key}_dir'] = action  # type: ignore[literal-required]
             final['install_dir'] = [kwargs['install_dir'][0] if kwargs['install_dir'] else True]
 
+    def __convert_bundle_shared_kwargs(self, kwargs: kwtypes.BundleShared, final: build.BuildTargetKeywordArguments) -> None:
+        for arg in ('bundle_resources', 'bundle_contents', 'bundle_extra_binaries'):
+            final[arg] = kwargs[arg]
+
+        final['info_plist'] = self.source_string_to_file(kwargs['info_plist'])
+
     def __convert_executable_kwargs(self, node: mparser.BaseNode, kwargs: kwtypes.Executable) -> build.ExecutableKeywordArguments:
         """Convert Executable arguments from DSL form to the build layer form.
 
@@ -3812,6 +3844,25 @@ class Interpreter(InterpreterBase, HoldableObject):
 
         return final
 
+    def __convert_app_bundle_kwargs(self, node: mparser.BaseNode, kwargs: kwtypes.AppBundle) -> build.ExecutableKeywordArguments:
+        """Convert AppBundle arguments from DSL form to the build layer form.
+
+        :param node: The Node being evaluated
+        :param kwargs: The DSL keyword arguments
+        :raises InvalidArguments: If both gui_app and win_subsystem are set
+        :raises InvalidArguments: If implib is false and export_dynamic is true
+        :raises InvalidArguments: If the rust_crate_type is set to anything except bin
+        :return: The keyword arguments as the Build layer expects
+        """
+
+        final = self.__convert_executable_kwargs(node, kwargs)
+        self.__convert_bundle_shared_kwargs(kwargs, final)
+
+        for arg in ('bundle_layout', 'bundle_exe_dir_name'):
+            final[arg] = kwargs[arg]
+
+        return final
+
     def __convert_static_library_kwargs(self, node: mparser.BaseNode, kwargs: kwtypes.StaticLibrary) -> build.StaticLibraryKeywordArguments:
         """Convert StaticLibrary arguments to the Build format.
 
@@ -3858,6 +3909,24 @@ class Interpreter(InterpreterBase, HoldableObject):
             build.SharedLibrary.typename, extra_valid_types={'proc-macro'})
 
         final['win_subsystem'] = kwargs['win_subsystem'] or 'console'
+
+        return final
+
+    def __convert_framework_bundle_kwargs(self, node: mparser.BaseNode, kwargs: kwtypes.FrameworkBundle) -> build.ExecutableKeywordArguments:
+        """Convert FrameworkBundle arguments from DSL form to the build layer form.
+
+        :param node: The Node being evaluated
+        :param kwargs: The DSL keyword arguments
+        :raises InvalidArguments: If both gui_app and win_subsystem are set
+        :raises InvalidArguments: If implib is false and export_dynamic is true
+        :raises InvalidArguments: If the rust_crate_type is set to anything except bin
+        :return: The keyword arguments as the Build layer expects
+        """
+
+        final = self.__convert_shared_library_kwargs(node, kwargs)
+        self.__convert_bundle_shared_kwargs(kwargs, final)
+
+        final['framework_headers'] = kwargs['framework_headers']
 
         return final
 
@@ -3946,7 +4015,15 @@ class Interpreter(InterpreterBase, HoldableObject):
                      targetclass: T.Type[T.Union[build.Executable, build.StaticLibrary, build.SharedModule, build.SharedLibrary, build.Jar]],
                      shared_library_only: bool = True
                      ) -> T.Union[build.Executable, build.StaticLibrary, build.SharedModule, build.SharedLibrary, build.Jar]:
-        if targetclass not in {build.Executable, build.SharedLibrary, build.SharedModule, build.StaticLibrary, build.Jar}:
+        target = self.create_build_target(node, args, kwargs, targetclass, shared_library_only)
+        self.add_target(target.name, target)
+        return target
+
+    def create_build_target(self, node: mparser.BaseNode, args: T.Tuple[str, SourcesVarargsType],
+                            kwargs: T.Dict[str, TYPE_var], targetclass: T.Type[BT],
+                            shared_library_only: bool) -> BT:
+        if targetclass not in {build.Executable, build.SharedLibrary, build.SharedModule, build.StaticLibrary,
+                               build.Jar, build.AppBundle, build.FrameworkBundle}:
             mlog.debug('Unknown target type:', str(targetclass))
             raise RuntimeError('Unreachable code')
 
@@ -4025,6 +4102,11 @@ class Interpreter(InterpreterBase, HoldableObject):
                 node, T.cast('kwtypes.Executable', kwargs))
             target = build.Executable(name, self.subdir, for_machine, srcs, struct, objs,
                                       self.environment, self.compilers[for_machine], self.current_build_project(), nkwargs)
+        elif targetclass is build.AppBundle:
+            nkwargs = self.__convert_app_bundle_kwargs(
+                node, T.cast('kwtypes.AppBundle', kwargs))
+            target = build.AppBundle(name, self.subdir, for_machine, srcs, struct, objs,
+                                     self.environment, self.compilers[for_machine], self.current_build_project(), nkwargs)
         elif targetclass is build.StaticLibrary:
             nkwargs = self.__convert_static_library_kwargs(
                 node, T.cast('kwtypes.StaticLibrary', kwargs))
@@ -4035,6 +4117,12 @@ class Interpreter(InterpreterBase, HoldableObject):
                 node, T.cast('kwtypes.SharedLibrary', kwargs))
             target = build.SharedLibrary(name, self.subdir, for_machine, srcs, struct, objs,
                                          self.environment, self.compilers[for_machine], self.current_build_project(), nkwargs)
+            target.shared_library_only = shared_library_only
+        elif targetclass is build.FrameworkBundle:
+            nkwargs = self.__convert_framework_bundle_kwargs(
+                node, T.cast('kwtypes.FrameworkBundle', kwargs))
+            target = build.FrameworkBundle(name, self.subdir, for_machine, srcs, struct, objs,
+                                           self.environment, self.compilers[for_machine], self.current_build_project(), nkwargs)
             target.shared_library_only = shared_library_only
         elif targetclass is build.SharedModule:
             nkwargs = self.__convert_shared_module_kwargs(
@@ -4051,8 +4139,6 @@ class Interpreter(InterpreterBase, HoldableObject):
         if objs and target.uses_rust():
             FeatureNew.single_use('objects in Rust targets', '1.8.0', self.subproject)
 
-        self.add_target(name, target)
-        self.project_args_frozen = True
         return target
 
     def add_stdlib_info(self, target: build.BuildTarget) -> None:
