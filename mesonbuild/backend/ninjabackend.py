@@ -2425,13 +2425,6 @@ class NinjaBackend(backends.Backend):
             rel_generated.append(rels)
             abs_generated.append(abss)
 
-        # Swift outputs object files in the working directory (target's private dir), named after the input file
-        rel_objects = [] # Relative to build.ninja
-        for i in abssrc + abs_generated:
-            base = os.path.basename(i)
-            oname = os.path.splitext(base)[0] + '.o'
-            rel_objects.append(os.path.join(self.get_target_private_dir(target), oname))
-
         abs_headers = []
         header_imports = []
 
@@ -2484,6 +2477,17 @@ class NinjaBackend(backends.Backend):
 
         compile_rule = self.compiler_to_rule_name(swiftc)
         interface_rule = self.get_compiler_rule_name(swiftc.get_language(), swiftc.for_machine, 'INTERFACE')
+
+        # Swift outputs object files in the working directory (target's private dir), named after the input file
+        # In case of whole-module optimization, there is a object file named after the module.
+        rel_objects = [] # Relative to build.ninja
+        if '-wmo' in compile_args or '-whole-module-optimization' in compile_args:
+            rel_objects.append(os.path.join(self.get_target_private_dir(target), f'{target.swift_module_name}.o'))
+        else:
+            for i in abssrc + abs_generated:
+                base = os.path.basename(i)
+                oname = os.path.splitext(base)[0] + '.o'
+                rel_objects.append(os.path.join(self.get_target_private_dir(target), oname))
 
         # Generate the object files.
         elem = NinjaBuildElement(self.all_outputs, rel_objects, compile_rule, abssrc)
